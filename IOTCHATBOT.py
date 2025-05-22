@@ -1,340 +1,102 @@
-import speech_recognition as sr
-import pyttsx3
+import streamlit as st
 import requests
 import json
 from datetime import datetime
-import threading
 import time
+import speech_recognition as sr
+import pyttsx3
+import threading
+import queue
+import io
+import base64
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
+import numpy as np
 
-class VoiceIoTMenuBot:
+class IoTChatbotStreamlitVoice:
     def __init__(self):
-        # Inicializar reconocimiento de voz
-        self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
-        
-        # Inicializar síntesis de voz
-        self.tts_engine = pyttsx3.init()
-        self.configurar_voz()
-        
         # API Configuration
         self.API_KEY = 'sk-53751d5c6f344a5dbc0571de9f51313e'
         self.API_URL = 'https://api.deepseek.com/v1/chat/completions'
         
-        # Estado de conversación
-        self.conversacion_actual = []
-        self.proyecto_actual = {}
-        self.conversacion_activa = True
-        self.esperando_entrada = False
-
-    def configurar_voz(self):
-        """Configura la voz del sistema TTS"""
-        voices = self.tts_engine.getProperty('voices')
-        # Buscar voz en español o usar la primera disponible
-        for voice in voices:
-            if 'spanish' in voice.name.lower() or 'es' in voice.id.lower():
-                self.tts_engine.setProperty('voice', voice.id)
-                break
+        # Initialize TTS engine
+        if 'tts_engine' not in st.session_state:
+            st.session_state.tts_engine = self.init_tts()
         
-        # Configurar velocidad y volumen
-        self.tts_engine.setProperty('rate', 170)  # Velocidad
-        self.tts_engine.setProperty('volume', 0.9)  # Volumen
+        # Initialize Speech Recognition
+        if 'recognizer' not in st.session_state:
+            st.session_state.recognizer = sr.Recognizer()
+            st.session_state.microphone = sr.Microphone()
+        
+        # Initialize session state
+        if 'conversacion_actual' not in st.session_state:
+            st.session_state.conversacion_actual = []
+        if 'proyecto_actual' not in st.session_state:
+            st.session_state.proyecto_actual = {}
+        if 'chat_history' not in st.session_state:
+            st.session_state.chat_history = []
+        if 'voice_enabled' not in st.session_state:
+            st.session_state.voice_enabled = False
+        if 'audio_input' not in st.session_state:
+            st.session_state.audio_input = ""
+        if 'listening' not in st.session_state:
+            st.session_state.listening = False
 
-    def hablar(self, texto):
-        """Convierte texto a voz"""
-        print(f"🤖 Bot: {texto}")
-        self.tts_engine.say(texto)
-        self.tts_engine.runAndWait()
-
-    def escuchar(self, timeout=8):
-        """Captura audio del micrófono y lo convierte a texto"""
+    def init_tts(self):
+        """Initialize Text-to-Speech engine"""
         try:
-            with self.microphone as source:
-                print("🎤 Escuchando... (habla ahora)")
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=15)
+            engine = pyttsx3.init()
+            voices = engine.getProperty('voices')
             
-            print("🔄 Procesando audio...")
-            texto = self.recognizer.recognize_google(audio, language='es-ES')
-            print(f"👤 Usuario: {texto}")
-            return texto.lower()
+            # Try to set Spanish voice
+            for voice in voices:
+                if 'spanish' in voice.name.lower() or 'es' in voice.id.lower():
+                    engine.setProperty('voice', voice.id)
+                    break
+            
+            engine.setProperty('rate', 170)
+            engine.setProperty('volume', 0.9)
+            return engine
+        except Exception as e:
+            st.error(f"Error inicializando TTS: {e}")
+            return None
+
+    def speak_text(self, text):
+        """Convert text to speech"""
+        if st.session_state.voice_enabled and st.session_state.tts_engine:
+            try:
+                # Run TTS in a separate thread to avoid blocking
+                def tts_thread():
+                    st.session_state.tts_engine.say(text)
+                    st.session_state.tts_engine.runAndWait()
+                
+                thread = threading.Thread(target=tts_thread)
+                thread.daemon = True
+                thread.start()
+                
+            except Exception as e:
+                st.error(f"Error en síntesis de voz: {e}")
+
+    def listen_audio(self, timeout=8):
+        """Capture audio from microphone and convert to text"""
+        try:
+            with st.session_state.microphone as source:
+                st.session_state.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = st.session_state.recognizer.listen(source, timeout=timeout, phrase_time_limit=15)
+            
+            text = st.session_state.recognizer.recognize_google(audio, language='es-ES')
+            return text.lower()
             
         except sr.WaitTimeoutError:
             return "timeout"
         except sr.UnknownValueError:
             return "no_entendido"
         except sr.RequestError as e:
-            print(f"Error del servicio de reconocimiento: {e}")
+            st.error(f"Error del servicio de reconocimiento: {e}")
             return "error_servicio"
-
-    def detectar_numero_opcion(self, texto):
-        """Detecta números de opciones del menú en el texto"""
-        # Mapeo de números en texto a dígitos
-        numeros_texto = {
-            'uno': '1', 'una': '1',
-            'dos': '2', 
-            'tres': '3',
-            'cuatro': '4',
-            'cinco': '5',
-            'seis': '6',
-            'siete': '7',
-            'ocho': '8'
-        }
-        
-        # Buscar números directos
-        for i in range(1, 9):
-            if str(i) in texto:
-                return str(i)
-        
-        # Buscar números en texto
-        for palabra, numero in numeros_texto.items():
-            if palabra in texto:
-                return numero
-        
-        return None
-
-    def detectar_intencion_menu(self, texto):
-        """Detecta intenciones específicas del menú basadas en palabras clave"""
-        intenciones = {
-            '1': ['idea', 'generar', 'negocio', 'emprender', 'innovar'],
-            '2': ['plan', 'negocio', 'business', 'planificar', 'desarrollar'],
-            '3': ['financiero', 'dinero', 'proyección', 'ganancia', 'inversión', 'costo'],
-            '4': ['mercado', 'competencia', 'análisis', 'oportunidad', 'sector'],
-            '5': ['pregunta', 'consulta', 'duda', 'mentor', 'ayuda'],
-            '6': ['resumen', 'proyecto', 'actual', 'ver'],
-            '7': ['limpiar', 'borrar', 'nuevo', 'reiniciar'],
-            '8': ['salir', 'terminar', 'adiós', 'finalizar', 'cerrar']
-        }
-        
-        for opcion, palabras_clave in intenciones.items():
-            if any(palabra in texto for palabra in palabras_clave):
-                return opcion
-        
-        return None
-
-    def presentar_menu_voz(self):
-        """Presenta el menú principal por voz"""
-        menu_texto = """
-        Bienvenido al Chatbot de Emprendimiento IoT. 
-        Tienes las siguientes opciones:
-        
-        Opción 1: Generar ideas de negocio IoT
-        Opción 2: Desarrollar plan de negocio  
-        Opción 3: Crear proyecciones financieras
-        Opción 4: Analizar mercado IoT
-        Opción 5: Consulta libre con mentor
-        Opción 6: Ver resumen del proyecto actual
-        Opción 7: Limpiar conversación
-        Opción 8: Salir
-        
-        Puedes decir el número de la opción o describir lo que necesitas.
-        """
-        self.hablar(menu_texto)
-
-    def obtener_entrada_voz(self, pregunta, timeout=10):
-        """Obtiene entrada específica por voz con reintentos"""
-        intentos = 0
-        max_intentos = 3
-        
-        while intentos < max_intentos:
-            self.hablar(pregunta)
-            respuesta = self.escuchar(timeout)
-            
-            if respuesta == "timeout":
-                if intentos < max_intentos - 1:
-                    self.hablar("No te escuché. Vamos a intentar de nuevo.")
-                intentos += 1
-                continue
-            elif respuesta == "no_entendido":
-                if intentos < max_intentos - 1:
-                    self.hablar("No pude entender. Por favor habla más claro.")
-                intentos += 1
-                continue
-            elif respuesta == "error_servicio":
-                self.hablar("Hay un problema técnico. Intentemos una vez más.")
-                intentos += 1
-                continue
-            
-            return respuesta
-        
-        return "sin_respuesta"
-
-    def generar_ideas_iot_voz(self):
-        """Recolecta información por voz para generar ideas de negocio IoT"""
-        self.hablar("Perfecto, vamos a generar ideas de negocio IoT para ti.")
-        
-        # Recopilar información por voz
-        sector = self.obtener_entrada_voz("¿En qué sector te interesa emprender? Por ejemplo: salud, agricultura, hogar inteligente, industria o transporte.")
-        
-        if sector == "sin_respuesta":
-            sector = "general"
-            self.hablar("Usaré un enfoque general para las ideas.")
-        
-        presupuesto = self.obtener_entrada_voz("¿Cuál es tu rango de inversión inicial? Puedes decir bajo para menos de 10 mil dólares, medio para 10 a 50 mil, o alto para más de 50 mil.")
-        
-        if presupuesto == "sin_respuesta":
-            presupuesto = "medio"
-            self.hablar("Asumiré un presupuesto medio.")
-        
-        experiencia = self.obtener_entrada_voz("¿Cuál es tu nivel técnico? Principiante, intermedio o avanzado.")
-        
-        if experiencia == "sin_respuesta":
-            experiencia = "intermedio"
-            self.hablar("Consideraré un nivel intermedio.")
-        
-        mercado = self.obtener_entrada_voz("¿A qué mercado apuntas? Local, nacional o internacional.")
-        
-        if mercado == "sin_respuesta":
-            mercado = "nacional"
-        
-        recursos = self.obtener_entrada_voz("¿Qué recursos tienes disponibles? Por ejemplo: equipo, tiempo, conexiones.")
-        
-        if recursos == "sin_respuesta":
-            recursos = "recursos básicos"
-        
-        # Generar prompt
-        prompt = f"""Como experto en emprendimiento IoT, genera 3 ideas innovadoras de negocio considerando:
-
-PERFIL DEL EMPRENDEDOR:
-- Sector de interés: {sector}
-- Presupuesto inicial: {presupuesto}
-- Nivel técnico: {experiencia}
-- Mercado objetivo: {mercado}
-- Recursos disponibles: {recursos}
-
-Para cada idea, incluye:
-1. CONCEPTO: Descripción clara del producto/servicio IoT
-2. PROBLEMA QUE RESUELVE: Necesidad específica del mercado
-3. TECNOLOGÍA REQUERIDA: Sensores, conectividad, plataformas
-4. MODELO DE NEGOCIO: Cómo generar ingresos
-5. INVERSIÓN ESTIMADA: Capital inicial necesario
-6. VENTAJA COMPETITIVA: Qué te diferencia
-
-Enfócate en ideas viables, escalables y con potencial de ROI atractivo. Respuesta máximo 400 palabras para audio."""
-
-        return self.consultar_api(prompt)
-
-    def desarrollar_plan_negocio_voz(self):
-        """Desarrolla un plan de negocio con entrada por voz"""
-        idea = self.obtener_entrada_voz("Describe brevemente la idea IoT para la cual quieres el plan de negocio.")
-        
-        if idea == "sin_respuesta":
-            self.hablar("Desarrollaré un plan general de negocio IoT.")
-            idea = "startup IoT general"
-        
-        prompt = f"""Desarrolla un plan de negocio completo para esta idea IoT:
-
-IDEA SELECCIONADA: {idea}
-
-Estructura el plan con:
-1. RESUMEN EJECUTIVO - Visión, misión y propuesta de valor
-2. ANÁLISIS DE MERCADO - Tamaño, segmentación y competencia
-3. PRODUCTO/SERVICIO - Especificaciones y roadmap
-4. ESTRATEGIA DE MARKETING - Posicionamiento y canales
-5. ANÁLISIS FINANCIERO - Proyecciones y métricas clave
-6. PLAN DE IMPLEMENTACIÓN - Hitos y cronograma
-
-Máximo 400 palabras para presentación por voz."""
-        
-        return self.consultar_api(prompt)
-
-    def generar_proyecciones_financieras_voz(self):
-        """Genera proyecciones financieras con entrada por voz"""
-        self.hablar("Vamos a crear proyecciones financieras para tu negocio IoT.")
-        
-        precio = self.obtener_entrada_voz("¿Cuál sería el precio aproximado de tu producto o servicio IoT?")
-        usuarios = self.obtener_entrada_voz("¿Cuántos usuarios o clientes esperas en el primer año?")
-        crecimiento = self.obtener_entrada_voz("¿Qué porcentaje de crecimiento anual proyectas?")
-        costos_desarrollo = self.obtener_entrada_voz("¿Cuáles son tus costos de desarrollo estimados?")
-        costos_operacion = self.obtener_entrada_voz("¿Cuáles son tus costos operacionales mensuales estimados?")
-        
-        prompt = f"""Genera proyecciones financieras detalladas para un negocio IoT con:
-
-PARÁMETROS:
-- Precio del producto/servicio: {precio if precio != "sin_respuesta" else "precio competitivo"}
-- Usuarios proyectados año 1: {usuarios if usuarios != "sin_respuesta" else "crecimiento gradual"}
-- Crecimiento anual esperado: {crecimiento if crecimiento != "sin_respuesta" else "20-30%"}
-- Costos de desarrollo: {costos_desarrollo if costos_desarrollo != "sin_respuesta" else "moderados"}
-- Costos operacionales: {costos_operacion if costos_operacion != "sin_respuesta" else "escalables"}
-
-INCLUIR:
-1. Proyección de ingresos (3 años)
-2. Estructura de costos principales
-3. Punto de equilibrio estimado
-4. Métricas clave IoT (CAC, LTV, MRR)
-5. Recomendaciones de financiación
-
-Respuesta concisa para audio, máximo 350 palabras."""
-        
-        return self.consultar_api(prompt)
-
-    def analizar_mercado_iot_voz(self):
-        """Analiza oportunidades en el mercado IoT"""
-        prompt = """Realiza un análisis del mercado IoT actual incluyendo:
-
-1. TENDENCIAS GLOBALES IoT 2024-2025
-2. OPORTUNIDADES DE NICHO más prometedoras
-3. FACTORES DE ÉXITO clave en emprendimientos IoT
-4. ECOSISTEMA DE APOYO (aceleradoras, fondos, programas)
-5. RECOMENDACIONES ESTRATÉGICAS para nuevos emprendedores
-
-Enfoque práctico y conciso para presentación por voz, máximo 350 palabras."""
-        
-        return self.consultar_api(prompt)
-
-    def consulta_libre_voz(self):
-        """Permite consultas libres con el mentor IoT por voz"""
-        self.hablar("Perfecto, soy tu mentor de emprendimiento IoT. ¿Qué te gustaría saber?")
-        
-        while True:
-            pregunta = self.obtener_entrada_voz("Hazme tu consulta, o di 'menú' para volver al menú principal.")
-            
-            if pregunta == "sin_respuesta":
-                self.hablar("No pude escuchar tu pregunta. ¿Quieres intentar de nuevo o volver al menú?")
-                continue
-            
-            if any(palabra in pregunta for palabra in ['menú', 'menu', 'volver', 'regresar', 'salir']):
-                self.hablar("Perfecto, regresemos al menú principal.")
-                break
-            
-            prompt = f"""Como mentor de emprendimiento IoT, responde esta consulta de manera práctica y conversacional:
-
-PREGUNTA: {pregunta}
-
-Proporciona consejos específicos, ejemplos cuando sea posible, y pasos accionables.
-Respuesta máximo 300 palabras para audio."""
-            
-            respuesta = self.consultar_api(prompt)
-            self.hablar(respuesta)
-            
-            continuar = self.obtener_entrada_voz("¿Tienes otra pregunta, o quieres volver al menú principal?")
-            if any(palabra in continuar for palabra in ['menú', 'menu', 'volver', 'no', 'salir']) if continuar != "sin_respuesta" else False:
-                break
-
-    def ver_resumen_proyecto_voz(self):
-        """Muestra resumen del proyecto por voz"""
-        if not self.conversacion_actual:
-            self.hablar("No hay proyecto activo todavía. Te recomiendo generar algunas ideas primero.")
-            return
-        
-        prompt = """Basándote en nuestra conversación, crea un resumen ejecutivo del proyecto IoT incluyendo:
-
-1. Idea principal desarrollada
-2. Mercado objetivo identificado  
-3. Propuesta de valor clave
-4. Próximos pasos recomendados
-5. Recursos necesarios prioritarios
-
-Resumen conciso para audio, máximo 250 palabras."""
-        
-        resumen = self.consultar_api(prompt)
-        self.hablar("Aquí tienes el resumen de tu proyecto:")
-        self.hablar(resumen)
-
-    def limpiar_conversacion_voz(self):
-        """Limpia el historial por voz"""
-        self.conversacion_actual = []
-        self.proyecto_actual = {}
-        self.hablar("Perfecto, he limpiado la conversación. Ahora puedes empezar un nuevo proyecto desde cero.")
+        except Exception as e:
+            st.error(f"Error general en reconocimiento: {e}")
+            return "error"
 
     def consultar_api(self, prompt, temperatura=0.7):
         """Consulta la API de DeepSeek con el prompt generado"""
@@ -346,18 +108,18 @@ Resumen conciso para audio, máximo 250 palabras."""
         mensajes = [
             {
                 'role': 'system',
-                'content': 'Eres un mentor experto en emprendimiento IoT con 15 años de experiencia. Ayudas a emprendedores a desarrollar ideas innovadoras, planes de negocio sólidos y estrategias de crecimiento en el ecosistema Internet of Things. Tus respuestas son prácticas, detalladas, conversacionales y optimizadas para ser escuchadas por voz.'
+                'content': 'Eres un mentor experto en emprendimiento IoT con 15 años de experiencia. Ayudas a emprendedores a desarrollar ideas innovadoras, planes de negocio sólidos y estrategias de crecimiento en el ecosistema Internet of Things. Tus respuestas son prácticas, detalladas y bien estructuradas.'
             }
         ]
         
-        mensajes.extend(self.conversacion_actual[-6:])  # Últimas 6 interacciones
+        mensajes.extend(st.session_state.conversacion_actual[-6:])
         mensajes.append({'role': 'user', 'content': prompt})
         
         data = {
             'model': 'deepseek-chat',
             'temperature': temperatura,
             'messages': mensajes,
-            'max_tokens': 800
+            'max_tokens': 1000
         }
         
         try:
@@ -366,121 +128,541 @@ Resumen conciso para audio, máximo 250 palabras."""
             resultado = response.json()['choices'][0]['message']['content']
             
             # Guardar en historial
-            self.conversacion_actual.append({'role': 'user', 'content': prompt})
-            self.conversacion_actual.append({'role': 'assistant', 'content': resultado})
+            st.session_state.conversacion_actual.append({'role': 'user', 'content': prompt})
+            st.session_state.conversacion_actual.append({'role': 'assistant', 'content': resultado})
             
             # Mantener solo las últimas 20 interacciones
-            if len(self.conversacion_actual) > 20:
-                self.conversacion_actual = self.conversacion_actual[-20:]
+            if len(st.session_state.conversacion_actual) > 20:
+                st.session_state.conversacion_actual = st.session_state.conversacion_actual[-20:]
             
             return resultado
             
         except requests.exceptions.HTTPError as err:
-            return f"Disculpa, tuve un problema con la API. Error: {err.response.text}"
+            return f"❌ Error con la API: {err.response.text}"
         except Exception as e:
-            return f"Disculpa, tuve un problema técnico: {e}"
+            return f"❌ Error técnico: {e}"
 
-    def procesar_opcion_menu(self, opcion):
-        """Procesa la opción seleccionada del menú"""
-        if opcion == '1':
-            respuesta = self.generar_ideas_iot_voz()
-            self.hablar("Aquí tienes las ideas de negocio IoT generadas para ti:")
-            self.hablar(respuesta)
-            
-        elif opcion == '2':
-            respuesta = self.desarrollar_plan_negocio_voz()
-            self.hablar("He desarrollado un plan de negocio completo para tu idea:")
-            self.hablar(respuesta)
-            
-        elif opcion == '3':
-            respuesta = self.generar_proyecciones_financieras_voz()
-            self.hablar("Aquí están las proyecciones financieras para tu negocio IoT:")
-            self.hablar(respuesta)
-            
-        elif opcion == '4':
-            respuesta = self.analizar_mercado_iot_voz()
-            self.hablar("Este es el análisis del mercado IoT actual:")
-            self.hablar(respuesta)
-            
-        elif opcion == '5':
-            self.consulta_libre_voz()
-            
-        elif opcion == '6':
-            self.ver_resumen_proyecto_voz()
-            
-        elif opcion == '7':
-            self.limpiar_conversacion_voz()
-            
-        elif opcion == '8':
-            self.hablar("Ha sido un placer ayudarte con tu emprendimiento IoT. ¡Mucho éxito en tu proyecto! Hasta luego.")
-            self.conversacion_activa = False
-            return False
-        
-        return True
+    def generar_ideas_iot(self, sector, presupuesto, experiencia, mercado, recursos):
+        """Genera ideas de negocio IoT"""
+        prompt = f"""Como experto en emprendimiento IoT, genera 3 ideas innovadoras de negocio considerando:
 
-    def ejecutar_menu_voz(self):
-        """Ejecuta el menú principal con reconocimiento de voz"""
-        self.hablar("¡Bienvenido al Chatbot de Emprendimiento IoT con reconocimiento de voz! Te ayudaré a desarrollar ideas innovadoras y planes de negocio para el ecosistema IoT.")
+PERFIL DEL EMPRENDEDOR:
+- Sector de interés: {sector}
+- Presupuesto inicial: {presupuesto}
+- Nivel técnico: {experiencia}
+- Mercado objetivo: {mercado}
+- Recursos disponibles: {recursos}
+
+Para cada idea, incluye:
+1. **CONCEPTO**: Descripción clara del producto/servicio IoT
+2. **PROBLEMA QUE RESUELVE**: Necesidad específica del mercado
+3. **TECNOLOGÍA REQUERIDA**: Sensores, conectividad, plataformas
+4. **MODELO DE NEGOCIO**: Cómo generar ingresos
+5. **INVERSIÓN ESTIMADA**: Capital inicial necesario
+6. **VENTAJA COMPETITIVA**: Qué te diferencia
+
+Enfócate en ideas viables, escalables y con potencial de ROI atractivo."""
+
+        return self.consultar_api(prompt)
+
+    def desarrollar_plan_negocio(self, idea):
+        """Desarrolla un plan de negocio completo"""
+        prompt = f"""Desarrolla un plan de negocio completo para esta idea IoT:
+
+**IDEA SELECCIONADA**: {idea}
+
+Estructura el plan con:
+1. **RESUMEN EJECUTIVO** - Visión, misión y propuesta de valor
+2. **ANÁLISIS DE MERCADO** - Tamaño, segmentación y competencia
+3. **PRODUCTO/SERVICIO** - Especificaciones y roadmap
+4. **ESTRATEGIA DE MARKETING** - Posicionamiento y canales
+5. **ANÁLISIS FINANCIERO** - Proyecciones y métricas clave
+6. **PLAN DE IMPLEMENTACIÓN** - Hitos y cronograma
+
+Proporciona detalles específicos y accionables para cada sección."""
         
-        # Verificar micrófono
-        try:
-            with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source, duration=2)
-            print("✅ Micrófono configurado correctamente")
-        except Exception as e:
-            print(f"❌ Error con el micrófono: {e}")
-            self.hablar("Hay un problema con el micrófono. Verifica que esté conectado correctamente.")
-            return
+        return self.consultar_api(prompt)
+
+    def generar_proyecciones_financieras(self, precio, usuarios, crecimiento, costos_desarrollo, costos_operacion):
+        """Genera proyecciones financieras"""
+        prompt = f"""Genera proyecciones financieras detalladas para un negocio IoT con:
+
+**PARÁMETROS**:
+- Precio del producto/servicio: {precio}
+- Usuarios proyectados año 1: {usuarios}
+- Crecimiento anual esperado: {crecimiento}%
+- Costos de desarrollo: ${costos_desarrollo:,}
+- Costos operacionales mensuales: ${costos_operacion:,}
+
+**INCLUIR**:
+1. **Proyección de ingresos** (3 años)
+2. **Estructura de costos** principales
+3. **Punto de equilibrio** estimado
+4. **Métricas clave IoT** (CAC, LTV, MRR)
+5. **Recomendaciones de financiación**
+6. **Análisis de ROI**
+
+Presenta los números de forma clara y estructurada."""
         
-        while self.conversacion_activa:
-            try:
-                # Presentar menú
-                self.presentar_menu_voz()
-                
-                # Obtener selección
-                entrada_usuario = self.obtener_entrada_voz("¿Qué opción eliges? Puedes decir el número o describir lo que necesitas.", timeout=15)
-                
-                if entrada_usuario == "sin_respuesta":
-                    self.hablar("No pude escuchar tu selección. Vamos a intentar de nuevo.")
-                    continue
-                
-                # Detectar opción
-                opcion = self.detectar_numero_opcion(entrada_usuario)
-                
-                if opcion is None:
-                    opcion = self.detectar_intencion_menu(entrada_usuario)
-                
-                if opcion and opcion in ['1', '2', '3', '4', '5', '6', '7', '8']:
-                    self.hablar(f"Has seleccionado la opción {opcion}.")
-                    continuar = self.procesar_opcion_menu(opcion)
-                    if not continuar:
-                        break
-                        
-                    # Preguntar si quiere continuar
-                    if opcion != '8':
-                        continuar_respuesta = self.obtener_entrada_voz("¿Quieres hacer algo más, o prefieres salir?")
-                        if continuar_respuesta != "sin_respuesta" and any(palabra in continuar_respuesta for palabra in ['salir', 'terminar', 'adiós', 'no']):
-                            self.hablar("¡Perfecto! Ha sido un placer ayudarte. ¡Éxito en tu emprendimiento IoT!")
-                            break
-                else:
-                    self.hablar("No pude identificar tu selección. Por favor, di el número de la opción que deseas, del 1 al 8.")
-                
-            except KeyboardInterrupt:
-                self.hablar("Conversación interrumpida. ¡Hasta luego!")
-                break
-            except Exception as e:
-                print(f"Error: {e}")
-                self.hablar("Disculpa, tuve un problema técnico. Vamos a continuar.")
+        return self.consultar_api(prompt)
+
+    def analizar_mercado_iot(self):
+        """Analiza oportunidades en el mercado IoT"""
+        prompt = """Realiza un análisis completo del mercado IoT actual incluyendo:
+
+1. **TENDENCIAS GLOBALES IoT 2024-2025**
+2. **OPORTUNIDADES DE NICHO** más prometedoras
+3. **FACTORES DE ÉXITO** clave en emprendimientos IoT
+4. **ECOSISTEMA DE APOYO** (aceleradoras, fondos, programas)
+5. **DESAFÍOS COMUNES** y cómo superarlos
+6. **RECOMENDACIONES ESTRATÉGICAS** para nuevos emprendedores
+
+Proporciona datos específicos y insights accionables."""
+        
+        return self.consultar_api(prompt)
+
+    def consulta_libre(self, pregunta):
+        """Permite consultas libres con el mentor IoT"""
+        prompt = f"""Como mentor de emprendimiento IoT, responde esta consulta de manera práctica y detallada:
+
+**PREGUNTA**: {pregunta}
+
+Proporciona consejos específicos, ejemplos cuando sea posible, y pasos accionables.
+Estructura tu respuesta de forma clara y útil."""
+        
+        return self.consultar_api(prompt)
+
+    def ver_resumen_proyecto(self):
+        """Muestra resumen del proyecto"""
+        if not st.session_state.conversacion_actual:
+            return "No hay proyecto activo todavía. Te recomiendo generar algunas ideas primero."
+        
+        prompt = """Basándote en nuestra conversación, crea un resumen ejecutivo del proyecto IoT incluyendo:
+
+1. **Idea principal** desarrollada
+2. **Mercado objetivo** identificado  
+3. **Propuesta de valor** clave
+4. **Próximos pasos** recomendados
+5. **Recursos necesarios** prioritarios
+6. **Timeline** sugerido
+
+Proporciona un resumen completo y estructurado."""
+        
+        return self.consultar_api(prompt)
+
+def voice_interface_component():
+    """Component for voice interface controls"""
+    st.markdown("### 🎤 Control de Voz")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        voice_enabled = st.checkbox("🔊 Activar síntesis de voz", value=st.session_state.get('voice_enabled', False))
+        st.session_state.voice_enabled = voice_enabled
+    
+    with col2:
+        if st.button("🎤 Escuchar Micrófono", type="secondary"):
+            st.session_state.listening = True
+    
+    with col3:
+        if st.button("🔇 Detener Audio", type="secondary"):
+            st.session_state.listening = False
+            st.session_state.audio_input = ""
+    
+    # Audio input handling
+    if st.session_state.listening:
+        with st.spinner("🎤 Escuchando... Habla ahora"):
+            chatbot = IoTChatbotStreamlitVoice()
+            audio_text = chatbot.listen_audio()
+            
+            if audio_text == "timeout":
+                st.warning("⏰ Tiempo de espera agotado. Intenta de nuevo.")
+            elif audio_text == "no_entendido":
+                st.warning("❓ No pude entender el audio. Habla más claro.")
+            elif audio_text in ["error_servicio", "error"]:
+                st.error("❌ Error en el reconocimiento de voz.")
+            else:
+                st.success(f"✅ Escuchado: {audio_text}")
+                st.session_state.audio_input = audio_text
+            
+            st.session_state.listening = False
+    
+    # Display captured audio text
+    if st.session_state.audio_input:
+        st.info(f"🎤 **Entrada de voz**: {st.session_state.audio_input}")
+        return st.session_state.audio_input
+    
+    return None
 
 def main():
-    """Función principal"""
-    print("🚀 Iniciando Chatbot IoT con Reconocimiento de Voz y Menú Interactivo...")
-    print("🎤 Asegúrate de tener un micrófono conectado y funcional")
-    print("🔊 Habla claro y espera a que el bot termine de hablar antes de responder")
-    print("-" * 80)
+    st.set_page_config(
+        page_title="🚀 Chatbot IoT con Voz",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
     
-    bot = VoiceIoTMenuBot()
-    bot.ejecutar_menu_voz()
+    # Initialize chatbot
+    chatbot = IoTChatbotStreamlitVoice()
+    
+    # Header
+    st.title("🚀 Chatbot de Emprendimiento IoT con Voz")
+    st.markdown("### Tu mentor personal con capacidades de voz para desarrollar ideas innovadoras en IoT")
+    
+    # Voice interface
+    voice_interface_component()
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("📋 Menú de Opciones")
+        st.markdown("---")
+        
+        # Voice status
+        if st.session_state.voice_enabled:
+            st.success("🔊 Voz activada")
+        else:
+            st.info("🔇 Voz desactivada")
+        
+        st.markdown("---")
+        
+        # Menu options
+        opcion = st.selectbox(
+            "Selecciona una opción:",
+            [
+                "🏠 Inicio",
+                "💡 Generar Ideas IoT",
+                "📊 Plan de Negocio",
+                "💰 Proyecciones Financieras",
+                "📈 Análisis de Mercado",
+                "🤖 Consulta con Mentor",
+                "📋 Resumen del Proyecto",
+                "🔄 Limpiar Conversación"
+            ]
+        )
+        
+        st.markdown("---")
+        st.markdown("""
+        **🎤 Controles de Voz:**
+        - 🔊 Activa síntesis de voz
+        - 🎤 Usa el micrófono
+        - Habla claro y espera
+        
+        **📞 Contacto:**
+        - 📧 mentor@iot-startup.com
+        - 🌐 www.iot-emprendimiento.com
+        """)
+        
+        # Clear conversation button
+        if st.button("🗑️ Limpiar Todo", type="secondary"):
+            st.session_state.conversacion_actual = []
+            st.session_state.proyecto_actual = {}
+            st.session_state.chat_history = []
+            st.session_state.audio_input = ""
+            st.success("✅ Conversación limpiada")
+            st.rerun()
+    
+    # Main content area
+    if opcion == "🏠 Inicio":
+        st.markdown("""
+        ## 🎯 Bienvenido al Chatbot de Emprendimiento IoT con Voz
+        
+        Este asistente combina una interfaz visual moderna con capacidades completas de voz para ayudarte a desarrollar tu startup IoT.
+        
+        ### 🌟 Nuevas Características de Voz:
+        
+        - **🔊 Síntesis de Voz**: Escucha las respuestas del mentor
+        - **🎤 Reconocimiento de Voz**: Habla directamente con el asistente
+        - **🗣️ Interfaz Multimodal**: Usa voz, texto o ambos
+        - **🎧 Control Total**: Activa/desactiva funciones según necesites
+        
+        ### 🚀 ¿Qué puedes hacer?
+        
+        - **💡 Generar Ideas IoT**: Ideas personalizadas con entrada por voz
+        - **📊 Desarrollar Plan de Negocio**: Dicta tu idea y obtén un plan completo
+        - **💰 Proyecciones Financieras**: Calcula viabilidad con datos hablados
+        - **📈 Análisis de Mercado**: Escucha oportunidades actuales en IoT
+        - **🤖 Consultas de Voz**: Conversa naturalmente con tu mentor
+        - **📋 Seguimiento**: Resúmenes hablados de tu progreso
+        
+        ### 🎤 Cómo Usar la Voz:
+        
+        1. **Activa la síntesis de voz** en el panel superior
+        2. **Haz clic en "🎤 Escuchar Micrófono"** cuando quieras hablar
+        3. **Habla claro y espera** a que el sistema procese
+        4. **Combina voz e interfaz** como prefieras
+        
+        ¡Empecemos tu viaje emprendedor en IoT!
+        """)
+        
+        # Recent activity
+        if st.session_state.conversacion_actual:
+            st.markdown("### 📈 Actividad Reciente")
+            with st.expander("Ver conversación reciente"):
+                for mensaje in st.session_state.conversacion_actual[-4:]:
+                    if mensaje['role'] == 'user':
+                        st.markdown(f"**👤 Tú:** {mensaje['content'][:200]}...")
+                    else:
+                        st.markdown(f"**🤖 Mentor:** {mensaje['content'][:200]}...")
+    
+    elif opcion == "💡 Generar Ideas IoT":
+        st.header("💡 Generador de Ideas IoT")
+        st.markdown("Cuéntame sobre ti para generar ideas personalizadas (usa voz o texto)")
+        
+        # Check for voice input
+        voice_input = voice_interface_component()
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            sector = st.selectbox(
+                "🏭 Sector de interés:",
+                ["Salud", "Agricultura", "Hogar inteligente", "Industria 4.0", "Transporte", "Educación", "Retail", "Otro"]
+            )
+            
+            presupuesto = st.selectbox(
+                "💵 Presupuesto inicial:",
+                ["Bajo (< $10K)", "Medio ($10K - $50K)", "Alto (> $50K)"]
+            )
+            
+            experiencia = st.selectbox(
+                "🎓 Nivel técnico:",
+                ["Principiante", "Intermedio", "Avanzado"]
+            )
+        
+        with col2:
+            mercado = st.selectbox(
+                "🌍 Mercado objetivo:",
+                ["Local", "Nacional", "Internacional"]
+            )
+            
+            # Use voice input if available, otherwise text area
+            recursos_default = voice_input if voice_input else ""
+            recursos = st.text_area(
+                "🛠️ Recursos disponibles:",
+                value=recursos_default,
+                placeholder="Ej: Equipo de desarrollo, capital semilla, conexiones industriales... (o usa el micrófono)",
+                help="💡 Puedes usar el micrófono para dictar esta información"
+            )
+        
+        if st.button("🚀 Generar Ideas", type="primary"):
+            if recursos:
+                with st.spinner("🤖 Generando ideas innovadoras..."):
+                    ideas = chatbot.generar_ideas_iot(sector, presupuesto, experiencia, mercado, recursos)
+                
+                st.markdown("### 💡 Ideas Generadas")
+                st.markdown(ideas)
+                
+                # Speak the response if voice is enabled
+                if st.session_state.voice_enabled:
+                    chatbot.speak_text("He generado ideas personalizadas para tu emprendimiento IoT. Revisa los detalles en pantalla.")
+                
+                # Save to chat history
+                st.session_state.chat_history.append({
+                    'timestamp': datetime.now().strftime("%H:%M:%S"),
+                    'type': 'Ideas IoT',
+                    'content': ideas
+                })
+            else:
+                st.warning("⚠️ Por favor, describe tus recursos disponibles (texto o voz)")
+    
+    elif opcion == "📊 Plan de Negocio":
+        st.header("📊 Desarrollador de Plan de Negocio")
+        
+        # Voice input component
+        voice_input = voice_interface_component()
+        
+        # Use voice input if available
+        idea_default = voice_input if voice_input else ""
+        idea = st.text_area(
+            "💭 Describe tu idea IoT:",
+            value=idea_default,
+            placeholder="Ej: Una plataforma IoT para monitorear la calidad del aire... (o usa el micrófono)",
+            height=100,
+            help="💡 Puedes usar el micrófono para dictar tu idea"
+        )
+        
+        if st.button("📈 Crear Plan de Negocio", type="primary"):
+            if idea:
+                with st.spinner("📋 Desarrollando tu plan de negocio..."):
+                    plan = chatbot.desarrollar_plan_negocio(idea)
+                
+                st.markdown("### 📊 Plan de Negocio Completo")
+                st.markdown(plan)
+                
+                # Speak the response if voice is enabled
+                if st.session_state.voice_enabled:
+                    chatbot.speak_text("He creado un plan de negocio completo para tu idea IoT. Revisa todos los detalles en pantalla.")
+                
+                # Save to chat history
+                st.session_state.chat_history.append({
+                    'timestamp': datetime.now().strftime("%H:%M:%S"),
+                    'type': 'Plan de Negocio',
+                    'content': plan
+                })
+            else:
+                st.warning("⚠️ Por favor, describe tu idea IoT")
+    
+    elif opcion == "💰 Proyecciones Financieras":
+        st.header("💰 Calculadora de Proyecciones Financieras")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            precio = st.number_input("💵 Precio del producto/servicio ($):", min_value=1, value=100)
+            usuarios = st.number_input("👥 Usuarios proyectados año 1:", min_value=1, value=1000)
+            crecimiento = st.slider("📈 Crecimiento anual (%):", 0, 200, 30)
+        
+        with col2:
+            costos_desarrollo = st.number_input("🛠️ Costos de desarrollo ($):", min_value=0, value=50000)
+            costos_operacion = st.number_input("🔄 Costos operacionales mensuales ($):", min_value=0, value=5000)
+        
+        if st.button("📊 Generar Proyecciones", type="primary"):
+            with st.spinner("📈 Calculando proyecciones financieras..."):
+                proyecciones = chatbot.generar_proyecciones_financieras(
+                    precio, usuarios, crecimiento, costos_desarrollo, costos_operacion
+                )
+            
+            st.markdown("### 💰 Proyecciones Financieras")
+            st.markdown(proyecciones)
+            
+            # Speak the response if voice is enabled
+            if st.session_state.voice_enabled:
+                chatbot.speak_text("He calculado las proyecciones financieras de tu negocio IoT. Revisa los números y métricas clave en pantalla.")
+            
+            # Save to chat history
+            st.session_state.chat_history.append({
+                'timestamp': datetime.now().strftime("%H:%M:%S"),
+                'type': 'Proyecciones Financieras',
+                'content': proyecciones
+            })
+    
+    elif opcion == "📈 Análisis de Mercado":
+        st.header("📈 Análisis del Mercado IoT")
+        
+        if st.button("🔍 Analizar Mercado IoT", type="primary"):
+            with st.spinner("📊 Analizando el mercado IoT actual..."):
+                analisis = chatbot.analizar_mercado_iot()
+            
+            st.markdown("### 📈 Análisis de Mercado IoT")
+            st.markdown(analisis)
+            
+            # Speak the response if voice is enabled
+            if st.session_state.voice_enabled:
+                chatbot.speak_text("He completado el análisis del mercado IoT actual. Encontrarás tendencias, oportunidades y recomendaciones estratégicas en pantalla.")
+            
+            # Save to chat history
+            st.session_state.chat_history.append({
+                'timestamp': datetime.now().strftime("%H:%M:%S"),
+                'type': 'Análisis de Mercado',
+                'content': analisis
+            })
+    
+    elif opcion == "🤖 Consulta con Mentor":
+        st.header("🤖 Consulta Libre con tu Mentor IoT")
+        st.markdown("Conversa con tu mentor usando voz, texto o ambos")
+        
+        # Voice interface for chat
+        voice_input = voice_interface_component()
+        
+        # Chat interface
+        if "mentor_messages" not in st.session_state:
+            st.session_state.mentor_messages = []
+        
+        # Display chat history
+        for message in st.session_state.mentor_messages:
+            if message["role"] == "user":
+                st.markdown(f"**👤 Tú:** {message['content']}")
+            else:
+                st.markdown(f"**🤖 Mentor:** {message['content']}")
+        
+        # Chat input (voice or text)
+        pregunta_default = voice_input if voice_input else ""
+        pregunta = st.text_area(
+            "💬 Hazle una pregunta a tu mentor:",
+            value=pregunta_default,
+            placeholder="Ej: ¿Cómo puedo validar mi idea IoT? (o usa el micrófono)",
+            key="mentor_input",
+            help="💡 Puedes usar el micrófono para hacer tu pregunta"
+        )
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📤 Enviar Pregunta", type="primary"):
+                if pregunta:
+                    # Add user message
+                    st.session_state.mentor_messages.append({"role": "user", "content": pregunta})
+                    
+                    with st.spinner("🤖 El mentor está pensando..."):
+                        respuesta = chatbot.consulta_libre(pregunta)
+                    
+                    # Add assistant response
+                    st.session_state.mentor_messages.append({"role": "assistant", "content": respuesta})
+                    
+                    # Speak the response if voice is enabled
+                    if st.session_state.voice_enabled:
+                        chatbot.speak_text(f"Aquí tienes mi respuesta: {respuesta[:200]}...")
+                    
+                    # Clear the input
+                    st.session_state.audio_input = ""
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Por favor, escribe o dicta tu pregunta")
+        
+        with col2:
+            if st.button("🗑️ Limpiar Chat"):
+                st.session_state.mentor_messages = []
+                st.session_state.audio_input = ""
+                st.rerun()
+    
+    elif opcion == "📋 Resumen del Proyecto":
+        st.header("📋 Resumen del Proyecto Actual")
+        
+        if st.button("📋 Generar Resumen", type="primary"):
+            with st.spinner("📝 Generando resumen del proyecto..."):
+                resumen = chatbot.ver_resumen_proyecto()
+            
+            st.markdown("### 📋 Resumen Ejecutivo")
+            st.markdown(resumen)
+            
+            # Speak the response if voice is enabled
+            if st.session_state.voice_enabled:
+                chatbot.speak_text("He generado un resumen ejecutivo de tu proyecto IoT. Incluye la idea principal, mercado objetivo y próximos pasos recomendados.")
+            
+            # Save to chat history
+            st.session_state.chat_history.append({
+                'timestamp': datetime.now().strftime("%H:%M:%S"),
+                'type': 'Resumen del Proyecto',
+                'content': resumen
+            })
+    
+    elif opcion == "🔄 Limpiar Conversación":
+        st.header("🔄 Limpiar Conversación")
+        
+        st.warning("⚠️ Esta acción eliminará todo el historial de conversación y el proyecto actual.")
+        
+        if st.button("🗑️ Confirmar Limpieza", type="secondary"):
+            st.session_state.conversacion_actual = []
+            st.session_state.proyecto_actual = {}
+            st.session_state.chat_history = []
+            st.session_state.audio_input = ""
+            if "mentor_messages" in st.session_state:
+                st.session_state.mentor_messages = []
+            
+            if st.session_state.voice_enabled:
+                chatbot.speak_text("He limpiado toda la conversación. Ahora puedes empezar un proyecto completamente nuevo.")
+            
+            st.success("✅ Conversación limpiada exitosamente")
+            time.sleep(1)
+            st.rerun()
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #666;'>
+        🚀 Chatbot IoT Emprendimiento con Voz | Desarrollado con ❤️ para emprendedores innovadores
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
